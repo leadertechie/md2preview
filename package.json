@@ -27,7 +27,7 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@leadertechie/md2compose": "^0.1.0-alpha.5",
+    "@leadertechie/md2compose": "^0.1.0-alpha.6",
     "@leadertechie/md2html": "^0.1.0-alpha.27",
     "@leadertechie/md2interact": "^0.1.0-alpha.6"
   },
