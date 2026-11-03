@@ -17,6 +17,7 @@ vi.mock('@leadertechie/md2html', () => ({
         '<link rel="stylesheet" href="/core.css">',
         '</head><body>',
         '<div data-interaction="mfe:header" data-mfe-src="/header.js"></div>',
+        '<a href="/login">Login</a>',
         '<script type="application/json" data-mfe-context>{"appName":"Toldby"}</script>',
         '<script type="module">init()</script>',
         '<script type="importmap">{}</script>',
@@ -52,7 +53,7 @@ describe('Md2Preview', () => {
 
     await el.render();
 
-    const container = el.shadowRoot!.querySelector('div') as HTMLElement;
+    const container = el.shadowRoot!.querySelector('div[part="preview"]') as HTMLElement;
 
     expect(container.querySelector('script[type="module"]')).toBeNull();
     expect(container.querySelector('script[type="importmap"]')).toBeNull();
@@ -80,5 +81,30 @@ describe('Md2Preview', () => {
 
     el.remove();
     expect(cleanup).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows the preview-only alert banner', async () => {
+    const el = new Md2Preview();
+    document.body.appendChild(el);
+    await el.render();
+
+    const banner = el.shadowRoot!.querySelector('[part="preview-alert"]');
+    expect(banner?.textContent).toContain('Preview only');
+  });
+
+  it('blocks interactive actions and flashes the alert', async () => {
+    const el = new Md2Preview();
+    el.value = '# hi';
+    el.viewPath = '__sys_/login.md';
+    document.body.appendChild(el);
+    await el.render();
+
+    const anchor = el.shadowRoot!.querySelector('a[href]') as HTMLAnchorElement;
+    const event = new MouseEvent('click', { bubbles: true, composed: true, cancelable: true });
+    const didDispatch = anchor.dispatchEvent(event);
+
+    expect(didDispatch).toBe(false); // defaultPrevented
+    const banner = el.shadowRoot!.querySelector('[part="preview-alert"]');
+    expect(banner?.classList.contains('preview-alert--active')).toBe(true);
   });
 });
