@@ -1,14 +1,9 @@
-import { Composer } from '@leadertechie/md2compose';
-import { MarkdownPipeline } from '@leadertechie/md2html';
 import { mountMFEs } from '@leadertechie/md2interact';
+import { PreviewActionGuard } from './preview-action-guard';
+import { prependAssetStylesheet, renderPreview } from './preview-renderer';
+import type { Md2PreviewLoadSource } from './preview-renderer';
 
-/**
- * Resolves non-view sources (base/layout/parent) during composition.
- * The host injects this because the renderer is storage-agnostic.
- */
-export type Md2PreviewLoadSource = (path: string) => Promise<string | null>;
-
-let pipeline: MarkdownPipeline | null = null;
+export type { Md2PreviewLoadSource } from './preview-renderer';
 
 const STYLES = `
 :host {
@@ -33,55 +28,6 @@ const STYLES = `
 `;
 
 /**
- * Matches the production template engine in toldby.page.routing so the
- * preview projection is byte-for-byte the served page.
- * See toldby.page.routing/src/discovery/template-engine.ts (getPipeline).
- */
-function getPipeline(): MarkdownPipeline {
-  if (!pipeline) {
-    pipeline = new MarkdownPipeline({
-      preserveRawHTML: true,
-      errorRecovery: 'warn',
-      allowedHTMLTags: [
-        'html', 'head', 'body', 'link', 'style', 'meta',
-        'button', 'p', 'div', 'span', 'section', 'header', 'footer', 'main', 'nav',
-        'img', 'a', 'hr', 'br', 'header-actions',
-      ],
-      allowedAttributes: {
-        '*': ['id', 'class', 'style', 'slot', 'data-*'],
-        script: ['type', 'src', 'nonce'],
-        link: ['rel', 'href', 'type'],
-        meta: ['name', 'content', 'charset'],
-        a: ['href', 'target'],
-        img: ['src', 'alt', 'width', 'height'],
-        div: [
-          'data-interaction', 'data-mfe-src', 'data-mfe-api', 'data-mfe-hash',
-          'data-mfe-props', 'data-mfe-env',
-        ],
-      },
-      allowedScriptTypes: ['importmap', 'module', 'application/json'],
-      wrapHtmlDocument: true,
-      styleOptions: {
-        classPrefix: 'md-',
-        addHeadingIds: true,
-        emitScopeAnchors: true,
-      },
-    });
-  }
-  return pipeline;
-}
-
-function applyBases(markdown: string, bases: Record<string, string>): string {
-  let result = markdown;
-  for (const [key, value] of Object.entries(bases)) {
-    result = result.split(`{{${key}}}`).join(value);
-  }
-  return result;
-}
-
-const INTERACTIVE_SELECTOR = 'a[href], button, [role="button"], input[type="submit"], input[type="button"]';
-
-/**
  * `<md2-preview>` — a renderer MFE.
  *
  * Projects a Markdown content bit through its layout shell and mounts the
@@ -101,8 +47,8 @@ export class Md2Preview extends HTMLElement {
   private readonly _root: ShadowRoot;
   private readonly _container: HTMLElement;
   private readonly _banner: HTMLElement;
+  private readonly _actionGuard: PreviewActionGuard;
   private _cleanup: (() => void) | null = null;
-  private _alertTimer: number | undefined;
 
   /** The unsaved Markdown source for the view being previewed. */
   value = '';
@@ -131,9 +77,7 @@ export class Md2Preview extends HTMLElement {
     this._container.setAttribute('part', 'preview');
     this._root.appendChild(this._container);
 
-    // Capture phase so we intercept before any MFE-internal handler runs.
-    this._root.addEventListener('click', this._onPreviewClick, true);
-    this._root.addEventListener('submit', this._onPreviewSubmit, true);
+    this._actionGuard = new PreviewActionGuard(this._root, this._banner);
   }
 
   get viewPath(): string {
@@ -147,41 +91,7 @@ export class Md2Preview extends HTMLElement {
   disconnectedCallback(): void {
     this._cleanup?.();
     this._cleanup = null;
-    if (this._alertTimer !== undefined) {
-      window.clearTimeout(this._alertTimer);
-      this._alertTimer = undefined;
-    }
-  }
-
-  private readonly _onPreviewClick = (event: Event): void => {
-    // composedPath() reaches through nested MFE shadow roots, so we can see
-    // the actual <a>/<button> that was clicked and block its default action.
-    const path = event.composedPath() as EventTarget[];
-    const interactive = path.find(
-      (node): node is HTMLElement =>
-        node instanceof HTMLElement && node.matches(INTERACTIVE_SELECTOR),
-    );
-
-    if (!interactive) return;
-
-    event.preventDefault();
-    event.stopImmediatePropagation();
-    this._flashAlert();
-  };
-
-  private readonly _onPreviewSubmit = (event: Event): void => {
-    event.preventDefault();
-    event.stopImmediatePropagation();
-    this._flashAlert();
-  };
-
-  private _flashAlert(): void {
-    if (this._alertTimer !== undefined) window.clearTimeout(this._alertTimer);
-    this._banner.classList.add('preview-alert--active');
-    this._alertTimer = window.setTimeout(() => {
-      this._banner.classList.remove('preview-alert--active');
-      this._alertTimer = undefined;
-    }, 1200);
+    this._actionGuard.clearTimer();
   }
 
   /**
@@ -193,49 +103,17 @@ export class Md2Preview extends HTMLElement {
     this._cleanup = null;
     this._container.innerHTML = '';
 
-    const viewPath = this.viewPath;
-    const { value, bases, context, loadSource } = this;
-
-    const composer = new Composer({
-      loader: async (path: string) => {
-        if (path === viewPath) return value;
-        return loadSource ? loadSource(path) : null;
-      },
-      uiBaseUrl: '',
+    const bases = this.bases;
+    const { html, context } = await renderPreview({
+      viewPath: this.viewPath,
+      value: this.value,
+      bases,
+      context: this.context,
+      loadSource: this.loadSource,
     });
+    this._container.innerHTML = html;
+    prependAssetStylesheet(this._container, bases.ASSET_BASE);
 
-    const composed = await composer.compose(viewPath);
-    const withBases = applyBases(composed, bases);
-    const html = getPipeline().renderMarkdown(withBases);
-    const doc = new DOMParser().parseFromString(html, 'text/html');
-
-    // Merge caller context over the page's own context block.
-    const ctxScript = doc.querySelector('script[data-mfe-context]');
-    let ctx: Record<string, unknown> = { ...context };
-    if (ctxScript?.textContent) {
-      try {
-        ctx = { ...JSON.parse(ctxScript.textContent), ...context };
-      } catch {
-        // Ignore malformed context — keep the caller-provided snapshot.
-      }
-    }
-
-    // Drop the page's module/importmap bootstrap scripts: we boot the
-    // contained MFEs via the scoped mountMFEs below instead.
-    doc
-      .querySelectorAll('script[type="module"], script[type="importmap"]')
-      .forEach((s) => s.remove());
-
-    this._container.innerHTML = doc.body ? doc.body.innerHTML : '';
-
-    const assetBase = bases.ASSET_BASE;
-    if (assetBase) {
-      const link = document.createElement('link');
-      link.rel = 'stylesheet';
-      link.href = `${assetBase.replace(/\/+$/, '')}/core.css`;
-      this._container.insertBefore(link, this._container.firstChild);
-    }
-
-    this._cleanup = await mountMFEs({ root: this._container, context: ctx });
+    this._cleanup = await mountMFEs({ root: this._container, context });
   }
 }
